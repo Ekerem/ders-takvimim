@@ -118,17 +118,229 @@ public class CalendarBridge {
 
     /**
      * Tek bir ders örneğini değiştirir. Örnek tekrar eden bir serinin parçasıysa yalnızca o hafta
-     * için bir istisna oluşturulur; serinin diğer haftaları aynen kalır.
+     * değişir; serinin diğer haftaları aynen kalır. Telefonların takvim servisleri bu konuda farklı
+     * davrandığı için üç yol sırayla denenir:
+     *  1) Android'in "istisna" kaydı (renk anahtarıyla)
+     *  2) aynı kayıt, renk anahtarı yerine doğrudan renkle
+     *  3) o haftanın dersini ayrı bir etkinlik olarak ekleyip seriden çıkarmak (EXDATE)
      */
     private void applyToInstance(long eventId, long begin, boolean master, ContentValues v) {
-        if (master) {
-            v.put(Events.ORIGINAL_INSTANCE_TIME, begin);
-            if (!v.containsKey(Events.STATUS)) v.put(Events.STATUS, Events.STATUS_CONFIRMED);
-            Uri uri = ContentUris.withAppendedId(Events.CONTENT_EXCEPTION_URI, eventId);
-            if (resolver.insert(uri, v) == null) throw new IllegalStateException("Takvim bu değişikliği kaydedemedi.");
-        } else {
+        if (!master) {
             Uri uri = ContentUris.withAppendedId(Events.CONTENT_URI, eventId);
             if (resolver.update(uri, v, null, null) < 1) throw new IllegalStateException("Ders takvimde bulunamadı. Yenileyip tekrar dene.");
+            return;
+        }
+        StringBuilder why = new StringBuilder();
+
+        // 1) istisna kaydı
+        ContentValues ex = new ContentValues(v);
+        ex.put(Events.ORIGINAL_INSTANCE_TIME, begin);
+        if (!ex.containsKey(Events.STATUS)) ex.put(Events.STATUS, Events.STATUS_CONFIRMED);
+        if (ex.containsKey(Events.DTEND)) {               // istisnada DTEND yerine süre kullanılır
+            long st = ex.containsKey(Events.DTSTART) ? ex.getAsLong(Events.DTSTART) : begin;
+            ex.put(Events.DURATION, "P" + ((ex.getAsLong(Events.DTEND) - st) / 1000) + "S");
+            ex.remove(Events.DTEND);
+        }
+        Uri exUri = ContentUris.withAppendedId(Events.CONTENT_EXCEPTION_URI, eventId);
+        try {
+            if (resolver.insert(exUri, ex) != null) return;
+            why.append("1:null ");
+        } catch (Exception e) {
+            why.append("1:").append(e.getClass().getSimpleName()).append(' ');
+        }
+
+        // 2) doğrudan renkle
+        if (ex.containsKey(Events.EVENT_COLOR_KEY)) {
+            ContentValues ex2 = new ContentValues(ex);
+            boolean paid = PAID_KEY.equals(ex2.getAsString(Events.EVENT_COLOR_KEY));
+            ex2.remove(Events.EVENT_COLOR_KEY);
+            ex2.put(Events.EVENT_COLOR, paid ? PAID_ARGB : UNPAID_ARGB);
+            try {
+                if (resolver.insert(exUri, ex2) != null) return;
+                why.append("2:null ");
+            } catch (Exception e) {
+                why.append("2:").append(e.getClass().getSimpleName()).append(' ');
+            }
+        }
+
+        // 3) ayrı etkinlik + seriden çıkarma
+        try {
+            splitInstance(eventId, begin, v);
+        } catch (Exception e) {
+            why.append("3:").append(e.getMessage());
+            throw new IllegalStateException("Takvim bu değişikliği kaydedemedi. (" + why.toString().trim() + ")");
+        }
+    }
+
+    private static final String[] MASTER_COLS = {Events.CALENDAR_ID, Events.TITLE, Events.DESCRIPTION,
+            Events.EVENT_LOCATION, Events.EVENT_TIMEZONE, Events.EXDATE, Events.EVENT_COLOR_KEY, Events.EVENT_COLOR,
+            Events.AVAILABILITY, Events.ACCESS_LEVEL};
+
+    private void splitInstance(long eventId, long begin, ContentValues v) {
+        Uri masterUri = ContentUris.withAppendedId(Events.CONTENT_URI, eventId);
+        ContentValues copy = new ContentValues();
+        String exdate;
+        try (Cursor c = resolver.query(masterUri, MASTER_COLS, null, null, null)) {
+            if (c == null || !c.moveToFirst()) throw new IllegalStateException("seri bulunamadı");
+            copy.put(Events.CALENDAR_ID, c.getLong(0));
+            copy.put(Events.TITLE, c.getString(1));
+            if (!c.isNull(2)) copy.put(Events.DESCRIPTION, c.getString(2));
+            if (!c.isNull(3)) copy.put(Events.EVENT_LOCATION, c.getString(3));
+            copy.put(Events.EVENT_TIMEZONE, c.isNull(4) ? TimeZone.getDefault().getID() : c.getString(4));
+            exdate = c.isNull(5) ? "" : c.getString(5);
+            if (!c.isNull(6)) copy.put(Events.EVENT_COLOR_KEY, c.getString(6));
+            else if (!c.isNull(7)) copy.put(Events.EVENT_COLOR, c.getInt(7));
+            if (!c.isNull(8)) copy.put(Events.AVAILABILITY, c.getInt(8));
+            if (!c.isNull(9)) copy.put(Events.ACCESS_LEVEL, c.getInt(9));
+        }
+        boolean cancel = v.containsKey(Events.STATUS) && v.getAsInteger(Events.STATUS) == Events.STATUS_CANCELED;
+
+        Uri inserted = null;
+        if (!cancel) {
+            long end = instanceEnd(eventId, begin);
+            copy.put(Events.DTSTART, begin);
+            copy.put(Events.DTEND, end);
+            copy.putAll(v);                                   // yeni renk, başlık, saat vb.
+            copy.remove(Events.STATUS);
+            copy.remove(Events.ORIGINAL_INSTANCE_TIME);
+            copy.remove(Events.DURATION);
+            try {
+                inserted = resolver.insert(Events.CONTENT_URI, copy);
+            } catch (Exception e) {
+                inserted = null;
+            }
+            if (inserted == null && copy.containsKey(Events.EVENT_COLOR_KEY)) {
+                boolean paid = PAID_KEY.equals(copy.getAsString(Events.EVENT_COLOR_KEY));
+                copy.remove(Events.EVENT_COLOR_KEY);
+                copy.put(Events.EVENT_COLOR, paid ? PAID_ARGB : UNPAID_ARGB);
+                inserted = resolver.insert(Events.CONTENT_URI, copy);
+            }
+            if (inserted == null) throw new IllegalStateException("kopya eklenemedi");
+        }
+
+        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("UTC"));
+        String stamp = f.format(new java.util.Date(begin));
+        ContentValues mv = new ContentValues();
+        mv.put(Events.EXDATE, exdate.isEmpty() ? stamp : exdate + "," + stamp);
+        int n;
+        try {
+            n = resolver.update(masterUri, mv, null, null);
+        } catch (Exception e) {
+            n = 0;
+        }
+        if (n < 1) {
+            if (inserted != null) resolver.delete(inserted, null, null);   // yarım iş bırakma
+            throw new IllegalStateException("seri güncellenemedi");
+        }
+    }
+
+    private long instanceEnd(long eventId, long begin) {
+        Uri.Builder b = Instances.CONTENT_URI.buildUpon();
+        ContentUris.appendId(b, begin - 1000);
+        ContentUris.appendId(b, begin + 1000);
+        try (Cursor c = resolver.query(b.build(), new String[]{Instances.END},
+                Instances.EVENT_ID + "=? AND " + Instances.BEGIN + "=?",
+                new String[]{String.valueOf(eventId), String.valueOf(begin)}, null)) {
+            if (c != null && c.moveToFirst()) return c.getLong(0);
+        }
+        return begin + 3600_000L;
+    }
+
+    /* ---------- genel takvim komutları ----------
+       İleride bir telefonda farklı bir davranış çıkarsa, APK'yı değiştirmeden web tarafından
+       çözebilmek için. Yalnızca takvim (content://com.android.calendar/...) adreslerine izin verilir. */
+
+    private static Uri calUri(String uri) {
+        if (uri == null || !uri.startsWith("content://" + CalendarContract.AUTHORITY + "/"))
+            throw new IllegalArgumentException("Yalnızca takvim adreslerine izin var.");
+        return Uri.parse(uri);
+    }
+
+    private static ContentValues toValues(String json) throws Exception {
+        JSONObject o = new JSONObject(json);
+        ContentValues v = new ContentValues();
+        java.util.Iterator<String> it = o.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            Object x = o.get(k);
+            if (x == JSONObject.NULL) v.putNull(k);
+            else if (x instanceof Integer || x instanceof Long) v.put(k, ((Number) x).longValue());
+            else if (x instanceof Number) v.put(k, ((Number) x).doubleValue());
+            else if (x instanceof Boolean) v.put(k, ((Boolean) x) ? 1 : 0);
+            else v.put(k, x.toString());
+        }
+        return v;
+    }
+
+    private static String[] toArgs(String json) throws Exception {
+        if (json == null || json.isEmpty() || "null".equals(json)) return null;
+        JSONArray a = new JSONArray(json);
+        String[] r = new String[a.length()];
+        for (int i = 0; i < a.length(); i++) r[i] = a.isNull(i) ? null : a.get(i).toString();
+        return r;
+    }
+
+    @JavascriptInterface
+    public int bridgeVersion() {
+        return 2;
+    }
+
+    @JavascriptInterface
+    public String cpQuery(String uri, String projectionJson, String selection, String argsJson, String sort) {
+        try {
+            String[] proj = toArgs(projectionJson);
+            JSONArray out = new JSONArray();
+            try (Cursor c = resolver.query(calUri(uri), proj, selection == null || selection.isEmpty() ? null : selection,
+                    toArgs(argsJson), sort == null || sort.isEmpty() ? null : sort)) {
+                while (c != null && c.moveToNext()) {
+                    JSONObject row = new JSONObject();
+                    for (int i = 0; i < c.getColumnCount(); i++) {
+                        String name = c.getColumnName(i);
+                        switch (c.getType(i)) {
+                            case Cursor.FIELD_TYPE_NULL: row.put(name, JSONObject.NULL); break;
+                            case Cursor.FIELD_TYPE_INTEGER: row.put(name, c.getLong(i)); break;
+                            case Cursor.FIELD_TYPE_FLOAT: row.put(name, c.getDouble(i)); break;
+                            case Cursor.FIELD_TYPE_STRING: row.put(name, c.getString(i)); break;
+                            default: break;
+                        }
+                    }
+                    out.put(row);
+                }
+            }
+            return ok(out);
+        } catch (Exception e) {
+            return fail(e);
+        }
+    }
+
+    @JavascriptInterface
+    public String cpInsert(String uri, String valuesJson) {
+        try {
+            Uri r = resolver.insert(calUri(uri), toValues(valuesJson));
+            if (r == null) throw new IllegalStateException("Takvim kaydı reddetti.");
+            return ok(r.toString());
+        } catch (Exception e) {
+            return fail(e);
+        }
+    }
+
+    @JavascriptInterface
+    public String cpUpdate(String uri, String valuesJson, String selection, String argsJson) {
+        try {
+            return ok(resolver.update(calUri(uri), toValues(valuesJson),
+                    selection == null || selection.isEmpty() ? null : selection, toArgs(argsJson)));
+        } catch (Exception e) {
+            return fail(e);
+        }
+    }
+
+    @JavascriptInterface
+    public String cpDelete(String uri, String selection, String argsJson) {
+        try {
+            return ok(resolver.delete(calUri(uri), selection == null || selection.isEmpty() ? null : selection, toArgs(argsJson)));
+        } catch (Exception e) {
+            return fail(e);
         }
     }
 

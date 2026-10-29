@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0",
-  "apkMin": "1.0.0",
+  "version": "1.0.1",
+  "apkMin": "1.0.1",
   "apk": "https://github.com/Ekerem/ders-takvimim/releases/latest/download/ders-takvimim.apk",
-  "notes": "İlk sürüm"
+  "notes": "Haftalık derslerin ödendi olarak işaretlenmesi düzeltildi"
 }
