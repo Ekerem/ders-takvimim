@@ -1,0 +1,58 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Sürüm bilgisi web/version.json dosyasından okunur; tek yerden güncellenir.
+def ver = new groovy.json.JsonSlurper().parse(file("$rootDir/../web/version.json"))
+// Depo bilgisi config.json'dan gelir (owner/repo).
+def cfg = new groovy.json.JsonSlurper().parse(file("$rootDir/../config.json"))
+def pageUrl = "https://${cfg.owner.toLowerCase()}.github.io/${cfg.repo}/"
+
+android {
+    namespace 'com.madebyus.derstakvimim'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.madebyus.derstakvimim'
+        minSdk 24
+        targetSdk 34
+        versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
+        versionName ver.version
+        buildConfigField 'String', 'REMOTE_URL', "\"${pageUrl}\""
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    // Aynı anahtarla imzalanınca yeni APK eskisinin üstüne kurulabilir.
+    signingConfigs {
+        shared {
+            storeFile file('derstakvimim.keystore')
+            storePassword 'derstakvimim123'
+            keyAlias 'derstakvimim'
+            keyPassword 'derstakvimim123'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.shared
+        }
+        debug {
+            signingConfig signingConfigs.shared
+        }
+    }
+
+    sourceSets {
+        main {
+            assets.srcDirs = ["$rootDir/../web"]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
